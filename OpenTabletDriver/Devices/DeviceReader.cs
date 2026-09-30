@@ -104,7 +104,11 @@ namespace OpenTabletDriver.Devices
 
         protected void Main()
         {
-            MacOSRealtimeThread.Apply();
+            // Only batch-report devices (Bluetooth tablets paced at a fixed rate)
+            // need the time-constraint thread policy; USB and other devices keep
+            // the stock scheduler behavior.
+            if (Parser is IBatchReportParser<T>)
+                MacOSRealtimeThread.Apply();
             try
             {
                 Connected = true;
