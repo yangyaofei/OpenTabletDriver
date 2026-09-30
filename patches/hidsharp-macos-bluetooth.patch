@@ -1,0 +1,176 @@
+diff --git a/HidSharp/Platform/MacOS/MacHidDevice.cs b/HidSharp/Platform/MacOS/MacHidDevice.cs
+index b73ef4b..8809548 100644
+--- a/HidSharp/Platform/MacOS/MacHidDevice.cs
++++ b/HidSharp/Platform/MacOS/MacHidDevice.cs
+@@ -39,11 +39,55 @@ namespace HidSharp.Platform.MacOS
+ 
+         }
+ 
++        internal static int ResolveService(string key)
++        {
++            if (key == null) { return 0; }
++            int sep = key.LastIndexOf("#HID=", StringComparison.Ordinal);
++            if (sep < 0) { return NativeMethods.IORegistryEntryCopyFromPath(0, key); }
++
++            // key: <path>#HID=<vid>:<pid>:<idx>  — class matching on IOHIDDevice covers all subclasses.
++            string[] parts = key.Substring(sep + 5).Split(':');
++            if (parts.Length != 3) { return 0; }
++            int wantVid, wantPid, wantIdx;
++            if (!int.TryParse(parts[0], out wantVid) || !int.TryParse(parts[1], out wantPid) || !int.TryParse(parts[2], out wantIdx)) { return 0; }
++
++            var matching = NativeMethods.IOServiceMatching("IOHIDDevice"); // consumed by IOServiceGetMatchingServices
++            int iteratorObj;
++            if (NativeMethods.IOReturn.Success == NativeMethods.IOServiceGetMatchingServices(0, matching, out iteratorObj))
++            {
++                using (var iterator = iteratorObj.ToIOObject())
++                {
++                    int seen = 0;
++                    while (true)
++                    {
++                        int entry = NativeMethods.IOIteratorNext(iterator);
++                        if (entry == 0) { break; }
++                        using (entry.ToIOObject())
++                        {
++                            int? vid = null, pid = null;
++                            try
++                            {
++                                vid = NativeMethods.IORegistryEntryGetCFProperty_Int(entry, NativeMethods.kIOHIDVendorIDKey);
++                                pid = NativeMethods.IORegistryEntryGetCFProperty_Int(entry, NativeMethods.kIOHIDProductIDKey);
++                            }
++                            catch { }
++                            if (vid != null && pid != null && vid == wantVid && pid == wantPid)
++                            {
++                                if (seen == wantIdx) { return entry; }
++                                seen++;
++                            }
++                        }
++                    }
++                }
++            }
++            return 0;
++        }
++
+         internal static MacHidDevice TryCreate(string path)
+         {
+             var d = new MacHidDevice() { _path = path };
+ 
+-            var service = NativeMethods.IORegistryEntryCopyFromPath(0, path).ToIOObject();
++            var service = ResolveService(path).ToIOObject();
+             if (!service.IsSet) { return null; }
+ 
+             using (service)
+@@ -279,7 +323,7 @@ namespace HidSharp.Platform.MacOS
+             }
+ 
+             // Determine USB device from HID path
+-            var hidEntry = NativeMethods.IORegistryEntryCopyFromPath(masterPort, _path).ToIOObject();
++            var hidEntry = ResolveService(_path).ToIOObject();
+ 
+             int deviceEntry = 0;
+ 
+diff --git a/HidSharp/Platform/MacOS/MacHidManager.cs b/HidSharp/Platform/MacOS/MacHidManager.cs
+index f32f138..2947841 100644
+--- a/HidSharp/Platform/MacOS/MacHidManager.cs
++++ b/HidSharp/Platform/MacOS/MacHidManager.cs
+@@ -34,14 +34,12 @@ namespace HidSharp.Platform.MacOS
+             {
+                 RunAssert(manager.IsSet, "HidSharp IOHIDManagerCreate failed.");
+ 
+-                using (var matching = NativeMethods.IOServiceMatching("IOHIDDevice").ToCFType())
+-                {
+-                    RunAssert(matching.IsSet, "HidSharp IOServiceMatching failed.");
+-
+-                    var devicesChangedCallback = new NativeMethods.IOHIDDeviceCallback(DevicesChangedCallback);
+-                    NativeMethods.IOHIDManagerSetDeviceMatching(manager.Handle, matching.Handle);
+-                    NativeMethods.IOHIDManagerRegisterDeviceMatchingCallback(manager.Handle, devicesChangedCallback, IntPtr.Zero);
+-                    NativeMethods.IOHIDManagerRegisterDeviceRemovalCallback(manager.Handle, devicesChangedCallback, IntPtr.Zero);
++                // Patch: NULL matching enumerates every HID device, including Bluetooth HID
++                // (IOHIDUserDevice), which class-based matching misses on modern macOS.
++                var devicesChangedCallback = new NativeMethods.IOHIDDeviceCallback(DevicesChangedCallback);
++                NativeMethods.IOHIDManagerSetDeviceMatching(manager.Handle, IntPtr.Zero);
++                NativeMethods.IOHIDManagerRegisterDeviceMatchingCallback(manager.Handle, devicesChangedCallback, IntPtr.Zero);
++                NativeMethods.IOHIDManagerRegisterDeviceRemovalCallback(manager.Handle, devicesChangedCallback, IntPtr.Zero);
+ 
+                     var runLoop = NativeMethods.CFRunLoopGetCurrent();
+                     NativeMethods.CFRetain(runLoop);
+@@ -58,7 +56,6 @@ namespace HidSharp.Platform.MacOS
+                     }
+ 
+                     GC.KeepAlive(devicesChangedCallback);
+-                }
+             }
+         }
+ 
+@@ -67,9 +64,12 @@ namespace HidSharp.Platform.MacOS
+             DeviceList.Local.RaiseChanged();
+         }
+ 
++        readonly Dictionary<string, int> _keyCounts = new Dictionary<string, int>();
++
+         object[] GetDeviceKeys(string kind)
+         {
+             var paths = new List<string>();
++            _keyCounts.Clear();
+ 
+             var matching = NativeMethods.IOServiceMatching(kind).ToCFType(); // Consumed by IOServiceGetMatchingServices, so DON'T Dispose().
+             if (matching.IsSet)
+@@ -81,7 +81,8 @@ namespace HidSharp.Platform.MacOS
+                     {
+                         while (true)
+                         {
+-                            using (var handle = NativeMethods.IOIteratorNext(iterator).ToIOObject())
++                            int rawEntry = NativeMethods.IOIteratorNext(iterator);
++                            using (var handle = rawEntry.ToIOObject())
+                             {
+                                 if (!handle.IsSet) { break; }
+ 
+@@ -89,7 +90,21 @@ namespace HidSharp.Platform.MacOS
+                                 {
+                                     if (cfPath.IsSet)
+                                     {
+-                                        paths.Add(NativeMethods.CFStringGetCharacters(cfPath));
++                                        // Registry paths can collide between IOHIDUserDevice instances
++                                        // (e.g. Bluetooth HID); disambiguate with VID/PID + occurrence index.
++                                        int? vid = null, pid = null;
++                                        try
++                                        {
++                                            vid = NativeMethods.IORegistryEntryGetCFProperty_Int(rawEntry, NativeMethods.kIOHIDVendorIDKey);
++                                            pid = NativeMethods.IORegistryEntryGetCFProperty_Int(rawEntry, NativeMethods.kIOHIDProductIDKey);
++                                        }
++                                        catch { }
++                                        string key = NativeMethods.CFStringGetCharacters(cfPath)
++                                                   + "#HID=" + (vid ?? -1) + ":" + (pid ?? -1);
++                                        int idx;
++                                        _keyCounts.TryGetValue(key, out idx);
++                                        _keyCounts[key] = idx + 1;
++                                        paths.Add(key + ":" + idx);
+                                     }
+                                 }
+                             }
+diff --git a/HidSharp/Platform/MacOS/MacHidStream.cs b/HidSharp/Platform/MacOS/MacHidStream.cs
+index 8cd1af4..434d10a 100644
+--- a/HidSharp/Platform/MacOS/MacHidStream.cs
++++ b/HidSharp/Platform/MacOS/MacHidStream.cs
+@@ -49,7 +49,7 @@ namespace HidSharp.Platform.MacOS
+             IntPtr handle; int retryCount = 0, maxRetries = 10;
+             while (true)
+             {
+-                using (var service = NativeMethods.IORegistryEntryCopyFromPath(0, path).ToIOObject())
++                using (var service = MacHidDevice.ResolveService(path).ToIOObject())
+                 {
+                     string error;
+ 
+diff --git a/HidSharp/Platform/MacOS/NativeMethods.cs b/HidSharp/Platform/MacOS/NativeMethods.cs
+index 55ed63e..c2989f2 100644
+--- a/HidSharp/Platform/MacOS/NativeMethods.cs
++++ b/HidSharp/Platform/MacOS/NativeMethods.cs
+@@ -727,6 +727,9 @@ namespace HidSharp.Platform.MacOS
+         [DllImport(IOKit, EntryPoint = "IORegistryEntryCopyFromPath")]
+         public static extern int IORegistryEntryCopyFromPath(uint masterPort, IntPtr path);
+ 
++        [DllImport(IOKit, EntryPoint = "IORegistryEntryIDMatching")]
++        public static extern IntPtr IORegistryEntryIDMatching(ulong entryID);
++
+         public static int IORegistryEntryCopyFromPath(uint masterPort, string path)
+         {
+             var cfPath = CFStringCreateWithCharacters(path);

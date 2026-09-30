@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Threading;
@@ -103,14 +104,25 @@ namespace OpenTabletDriver.Devices
 
         protected void Main()
         {
+            MacOSRealtimeThread.Apply();
             try
             {
                 Connected = true;
                 while (Connected)
                 {
                     var data = ReportStream!.Read();
-                    if (Parser.Parse(data) is T report)
+
+                    if (Parser is IBatchReportParser<T> batchParser)
+                    {
+                        // Bluetooth tablets batch several chronological samples into
+                        // one HID report. Pace them out at the tablet's true sample
+                        // rate so downstream sees a continuous stream, like USB.
+                        PaceBatch(batchParser.ParseAll(data));
+                    }
+                    else if (Parser.Parse(data) is T report)
+                    {
                         OnReport(report);
+                    }
 
                     // We create a clone of the report to avoid data being modified on the tablet debugger.
                     if (RawClone && RawReport != null && Parser.Parse(data) is T debugReport)
@@ -141,6 +153,50 @@ namespace OpenTabletDriver.Devices
 
         protected virtual void OnReport(T report) => Report?.Invoke(this, report);
         protected virtual void OnRawReport(T report) => RawReport?.Invoke(this, report);
+
+        /// <summary>Stopwatch used for sample pacing and rate estimation.</summary>
+        private readonly System.Diagnostics.Stopwatch paceWatch = System.Diagnostics.Stopwatch.StartNew();
+
+        /// <summary>
+        /// Inter-frame emission interval for batched (Bluetooth) reports.
+        /// Matches the official Wacom driver's host-side spreading (WacSleep 3.7ms
+        /// between sub-frames): drains a burst faster than the tablet produces
+        /// samples (~7.5ms), keeping latency near zero and radio gaps under one
+        /// display frame. See tmp/wacom-official/analysis-report.md.
+        /// </summary>
+        private const double PaceFrameMs = 3.7;
+
+        /// <summary>Playback time of the last emitted sample (ms on <see cref="paceWatch"/>).</summary>
+        private double paceLastEmitMs;
+
+        private void PaceBatch(IEnumerable<T> reports)
+        {
+            int n = 0;
+            foreach (var report in reports)
+            {
+                double target = Math.Max(paceWatch.Elapsed.TotalMilliseconds, paceLastEmitMs + PaceFrameMs);
+                double wait = target - paceWatch.Elapsed.TotalMilliseconds;
+                if (wait > 0.2)
+                {
+                    // Coarse sleep for the bulk of the wait, then spin for sub-ms precision.
+                    var until = paceWatch.Elapsed.TotalMilliseconds + wait;
+                    while (true)
+                    {
+                        double remaining = until - paceWatch.Elapsed.TotalMilliseconds;
+                        if (remaining <= 0)
+                            break;
+                        if (remaining > 1.5)
+                            Thread.Sleep(1);
+                        else
+                            Thread.SpinWait(50);
+                    }
+                }
+
+                OnReport(report);
+                paceLastEmitMs = Math.Max(paceWatch.Elapsed.TotalMilliseconds, target);
+                n++;
+            }
+        }
 
         public void Dispose()
         {
