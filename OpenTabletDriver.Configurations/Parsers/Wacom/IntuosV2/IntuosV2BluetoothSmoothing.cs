@@ -50,6 +50,11 @@ namespace OpenTabletDriver.Configurations.Parsers.Wacom.IntuosV2
             hasInput = hasOutput = false;
         }
 
+        // ---- 遥测：只观测，不参与滤波。每 30s 输出一行 [TELEMETRY]（Log.Debug）----
+        // 位置：本文件 Filter() 末尾；输出目标：守护进程日志 Logs/*.json，Message 含 "[TELEMETRY] smoothing:"
+        private readonly System.Diagnostics.Stopwatch _teleWatch = System.Diagnostics.Stopwatch.StartNew();
+        private int _teleSamples, _teleFastResets, _teleSteady, _teleDepthSum;
+
         /// <summary>输入一个原始样本（平板 counts），返回平滑后位置。</summary>
         public (double X, double Y) Filter(double x, double y, int hoverDistance)
         {
@@ -67,7 +72,10 @@ namespace OpenTabletDriver.Configurations.Parsers.Wacom.IntuosV2
             {
                 double dx = x - lastInX, dy = y - lastInY;
                 if (dx * dx + dy * dy > (2 * jitter) * (2 * jitter))
+                {
                     depth = 1; // 快速运动：立即回浅，不拖影
+                    _teleFastResets++;
+                }
             }
             lastInX = x; lastInY = y; hasInput = true;
 
@@ -96,12 +104,23 @@ namespace OpenTabletDriver.Configurations.Parsers.Wacom.IntuosV2
             else if (Span(fifoX) <= 2 * jitter && Span(fifoY) <= 2 * jitter)
             {
                 outX = avgX; outY = avgY;
+                _teleSteady++;
             }
             else
             {
                 double ox = avgX - outX, oy = avgY - outY;
                 if (Math.Abs(ox) > HysteresisCounts) outX += ox - Math.Sign(ox) * HysteresisCounts;
                 if (Math.Abs(oy) > HysteresisCounts) outY += oy - Math.Sign(oy) * HysteresisCounts;
+            }
+            _teleSamples++; _teleDepthSum += depth;
+            if (_teleWatch.Elapsed.TotalSeconds >= 30)
+            {
+                OpenTabletDriver.Plugin.Log.Debug("Smoothing",
+                    $"[TELEMETRY] smoothing: avgDepth={(_teleDepthSum / (double)Math.Max(1, _teleSamples)):F1} " +
+                    $"depth={depth} target={target} h={h255} fastResets={_teleFastResets} " +
+                    $"steadyBypass={_teleSteady} samples={_teleSamples}");
+                _teleSamples = _teleFastResets = _teleSteady = _teleDepthSum = 0;
+                _teleWatch.Restart();
             }
             return (outX, outY);
         }

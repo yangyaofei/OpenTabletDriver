@@ -173,6 +173,13 @@ namespace OpenTabletDriver.Devices
         /// <summary>Playback time of the last emitted sample (ms on <see cref="paceWatch"/>).</summary>
         private double paceLastEmitMs;
 
+        // ---- 遥测：PaceBatch 发射滞后与批次规模，每 30s 输出一行（Log.Debug）----
+        // 位置：本文件 PaceBatch() 末尾；输出目标：守护进程日志 Logs/*.json，Message 含 "[TELEMETRY] pacing:"
+        // lagMax = 每帧实际发射时刻晚于计划时刻的最大值（ms）：调度饥饿/系统负载的直接证据
+        private readonly System.Diagnostics.Stopwatch paceTeleWatch = System.Diagnostics.Stopwatch.StartNew();
+        private double paceTeleLagMax;
+        private int paceTeleBatchMax, paceTeleEmits, paceTeleBatches;
+
         private void PaceBatch(IEnumerable<T> reports)
         {
             int n = 0;
@@ -197,8 +204,23 @@ namespace OpenTabletDriver.Devices
                 }
 
                 OnReport(report);
+                double emitLag = paceWatch.Elapsed.TotalMilliseconds - target;
+                if (emitLag > paceTeleLagMax) paceTeleLagMax = emitLag;
+                paceTeleEmits++;
                 paceLastEmitMs = Math.Max(paceWatch.Elapsed.TotalMilliseconds, target);
                 n++;
+            }
+
+            if (n > paceTeleBatchMax) paceTeleBatchMax = n;
+            paceTeleBatches++;
+            if (paceTeleWatch.Elapsed.TotalSeconds >= 30)
+            {
+                Log.Debug("Device",
+                    $"[TELEMETRY] pacing: lagMax={paceTeleLagMax:F1}ms batchMax={paceTeleBatchMax} " +
+                    $"emits={paceTeleEmits} batches={paceTeleBatches}");
+                paceTeleLagMax = 0;
+                paceTeleBatchMax = paceTeleEmits = paceTeleBatches = 0;
+                paceTeleWatch.Restart();
             }
         }
 
