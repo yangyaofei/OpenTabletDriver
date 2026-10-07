@@ -179,6 +179,9 @@ namespace OpenTabletDriver.Devices
         private readonly System.Diagnostics.Stopwatch paceTeleWatch = System.Diagnostics.Stopwatch.StartNew();
         private double paceTeleLagMax;
         private int paceTeleBatchMax, paceTeleEmits, paceTeleBatches;
+        // ---- 遥测：OnReport 同步段耗时（滤波器链→输出→CGEventPost 全在这段里）----
+        private double onReportTeleMax, onReportTeleSum;
+        private int onReportTeleN;
 
         private void PaceBatch(IEnumerable<T> reports)
         {
@@ -203,7 +206,12 @@ namespace OpenTabletDriver.Devices
                     }
                 }
 
+                var onReportWatch = System.Diagnostics.Stopwatch.StartNew();
                 OnReport(report);
+                double onReportMs = onReportWatch.Elapsed.TotalMilliseconds;
+                if (onReportMs > onReportTeleMax) onReportTeleMax = onReportMs;
+                onReportTeleSum += onReportMs;
+                onReportTeleN++;
                 double emitLag = paceWatch.Elapsed.TotalMilliseconds - target;
                 if (emitLag > paceTeleLagMax) paceTeleLagMax = emitLag;
                 paceTeleEmits++;
@@ -217,11 +225,49 @@ namespace OpenTabletDriver.Devices
             {
                 Log.Debug("Device",
                     $"[TELEMETRY] pacing: lagMax={paceTeleLagMax:F1}ms batchMax={paceTeleBatchMax} " +
-                    $"emits={paceTeleEmits} batches={paceTeleBatches}");
+                    $"emits={paceTeleEmits} batches={paceTeleBatches} " +
+                    $"onReportMax={onReportTeleMax:F2}ms onReportAvg={(onReportTeleSum / Math.Max(1, onReportTeleN)):F2}ms" +
+                    HidQueueDiag());
                 paceTeleLagMax = 0;
+                onReportTeleMax = onReportTeleSum = 0;
+                onReportTeleN = 0;
                 paceTeleBatchMax = paceTeleEmits = paceTeleBatches = 0;
                 paceTeleWatch.Restart();
             }
+        }
+
+        // HidSharp 内核送达→读取延迟诊断计（反射读取 MacHidStream 静态计；非 macOS/失败时静默）
+        private static string _hidQueueDiag;
+        private static bool _hidQueueDiagResolved;
+        private static System.Reflection.MethodInfo _diagSwapMax, _diagDepth;
+
+        private static string HidQueueDiag()
+        {
+            if (!_hidQueueDiagResolved)
+            {
+                _hidQueueDiagResolved = true;
+                try
+                {
+                    var asm = System.Reflection.Assembly.Load("HidSharpCore");
+                    var type = asm.GetType("HidSharp.Platform.MacOS.MacHidStream");
+                    if (type != null)
+                    {
+                        _diagSwapMax = type.GetMethod("SwapDiagMaxKernelToReadMs",
+                            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                        _diagDepth = type.GetProperty("DiagQueueDepth",
+                            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetMethod;
+                    }
+                }
+                catch { /* 静默降级 */ }
+            }
+            if (_diagSwapMax == null) return "";
+            try
+            {
+                var max = _diagSwapMax.Invoke(null, null);
+                var depth = _diagDepth?.Invoke(null, null);
+                return $" hidqMax={max}ms depth={depth}";
+            }
+            catch { return ""; }
         }
 
         public void Dispose()

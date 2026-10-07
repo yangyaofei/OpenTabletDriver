@@ -148,7 +148,7 @@ index f32f138..2947841 100644
                                  }
                              }
 diff --git a/HidSharp/Platform/MacOS/MacHidStream.cs b/HidSharp/Platform/MacOS/MacHidStream.cs
-index 8cd1af4..434d10a 100644
+index 8cd1af4..ca1cca1 100644
 --- a/HidSharp/Platform/MacOS/MacHidStream.cs
 +++ b/HidSharp/Platform/MacOS/MacHidStream.cs
 @@ -49,7 +49,7 @@ namespace HidSharp.Platform.MacOS
@@ -160,6 +160,57 @@ index 8cd1af4..434d10a 100644
                  {
                      string error;
  
+@@ -143,10 +143,30 @@ namespace HidSharp.Platform.MacOS
+                     {
+                         if (queue.Count < 512) { queue.Enqueue(reportBytes); Monitor.PulseAll(queue); }
+                     }
++
++                    // 诊断计：内核送达→应用读取 延迟（ms）与队列深度
++                    System.Threading.Interlocked.Increment(ref _diagEnqueued);
++                    _diagLastEnqueueTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                 }
+             }
+         }
+ 
++        // ---- 诊断计（供外部反射读取；单一 HID 流场景够用）----
++        public static long _diagEnqueued, _diagRead;
++        public static long _diagLastEnqueueTicks;
++        public static double _diagMaxKernelToReadMs;
++
++        /// <summary>返回并清零窗口最大内核→读取延迟；newVal 用于重置。</summary>
++        public static double SwapDiagMaxKernelToReadMs()
++        {
++            double v = _diagMaxKernelToReadMs;
++            _diagMaxKernelToReadMs = 0;
++            return v;
++        }
++
++        /// <summary>当前近似队列深度（入队数−读取数）。</summary>
++        public static long DiagQueueDepth => _diagEnqueued - _diagRead;
++
+         void RemovalCallback(IntPtr context, NativeMethods.IOReturn result, IntPtr sender)
+         {
+             CommonDisconnected(_inputQueue);
+@@ -187,7 +207,18 @@ namespace HidSharp.Platform.MacOS
+ 
+         public override int Read(byte[] buffer, int offset, int count)
+         {
+-            return CommonRead(buffer, offset, count, _inputQueue);
++            int n = CommonRead(buffer, offset, count, _inputQueue);
++            if (n > 0 && System.Threading.Interlocked.Read(ref _diagRead) < System.Threading.Interlocked.Read(ref _diagEnqueued))
++            {
++                System.Threading.Interlocked.Increment(ref _diagRead);
++                if (_diagLastEnqueueTicks != 0)
++                {
++                    double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - _diagLastEnqueueTicks)
++                                * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
++                    if (ms > _diagMaxKernelToReadMs) _diagMaxKernelToReadMs = ms;
++                }
++            }
++            return n;
+         }
+ 
+         public unsafe override void GetFeature(byte[] buffer, int offset, int count)
 diff --git a/HidSharp/Platform/MacOS/NativeMethods.cs b/HidSharp/Platform/MacOS/NativeMethods.cs
 index 55ed63e..c2989f2 100644
 --- a/HidSharp/Platform/MacOS/NativeMethods.cs

@@ -32,6 +32,9 @@ namespace OpenTabletDriver.Daemon
     {
         private const string AVALONIA_REVISION = "0.7.0.0";
 
+        private DateTime _lastKnownTabletRemoval = DateTime.MinValue;
+        private const int _reconnectSettleSeconds = 5;
+
         public DriverDaemon(Driver driver)
         {
             Driver = driver;
@@ -47,11 +50,29 @@ namespace OpenTabletDriver.Daemon
             Driver.TabletsChanged += (sender, e) => TabletsChanged?.Invoke(sender, e);
             Driver.CompositeDeviceHub.DevicesChanged += async (sender, args) =>
             {
-                if (!args.Additions.Any()) return;
+                if (!args.Additions.Any())
+                {
+                    // 记录已知平板被移除的时刻（睡眠断开签名），供重连自愈判定
+                    if (args.Removals.Any(x => Driver.KnownVendorIDs.Contains(x.VendorID)))
+                        _lastKnownTabletRemoval = DateTime.UtcNow;
+                    return;
+                }
 
                 // only re-initialize pipeline if a relevant device is plugged in
                 if (args.Additions.Any(x => Driver.KnownVendorIDs.Contains(x.VendorID)))
                 {
+                    // 自愈：睡醒重连（短时间内的移除→新增）时，IOKit/蓝牙侧的旧 HID 会话
+                    // teardown 是异步的；立即抢开会让新会话建立在半拆状态上，产生不可见
+                    // 的均匀延迟（光标迟滞）。等待落定后再重开可避免（实测：完整重启程序
+                    // 可恢复，快速 pkill 重启不能——差别即落定时间）。
+                    var sinceRemoval = (DateTime.UtcNow - _lastKnownTabletRemoval).TotalSeconds;
+                    if (sinceRemoval >= 0 && sinceRemoval < 600)
+                    {
+                        Log.Write(nameof(DriverDaemon),
+                            $"Tablet reconnected {sinceRemoval:F0}s after removal; waiting {_reconnectSettleSeconds}s " +
+                            "for HID session teardown to settle before re-detecting (wake-reconnect self-heal)");
+                        await Task.Delay(TimeSpan.FromSeconds(_reconnectSettleSeconds));
+                    }
                     await DetectTablets();
                     await SetSettings(Settings);
                 }
