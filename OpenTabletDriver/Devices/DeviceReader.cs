@@ -239,7 +239,7 @@ namespace OpenTabletDriver.Devices
         // HidSharp 内核送达→读取延迟诊断计（反射读取 MacHidStream 静态计；非 macOS/失败时静默）
         private static string _hidQueueDiag;
         private static bool _hidQueueDiagResolved;
-        private static System.Reflection.MethodInfo _diagSwapMax, _diagDepth;
+        private static System.Reflection.MethodInfo _diagSwapMax, _diagSwapStale, _diagDepth;
 
         private static string HidQueueDiag()
         {
@@ -252,10 +252,10 @@ namespace OpenTabletDriver.Devices
                     var type = asm.GetType("HidSharp.Platform.MacOS.MacHidStream");
                     if (type != null)
                     {
-                        _diagSwapMax = type.GetMethod("SwapDiagMaxKernelToReadMs",
-                            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                        _diagDepth = type.GetProperty("DiagQueueDepth",
-                            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetMethod;
+                        var flags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static;
+                        _diagSwapMax = type.GetMethod("SwapDiagMaxKernelToReadMs", flags);
+                        _diagSwapStale = type.GetMethod("SwapDiagStaleWakeups", flags);
+                        _diagDepth = type.GetProperty("DiagQueueDepth", flags)?.GetMethod;
                     }
                 }
                 catch { /* 静默降级 */ }
@@ -264,8 +264,9 @@ namespace OpenTabletDriver.Devices
             try
             {
                 var max = _diagSwapMax.Invoke(null, null);
+                var stale = _diagSwapStale?.Invoke(null, null) ?? 0;
                 var depth = _diagDepth?.Invoke(null, null);
-                return $" hidqMax={max}ms depth={depth}";
+                return $" hidqMax={max}ms staleWake={stale} depth={depth}";
             }
             catch { return ""; }
         }

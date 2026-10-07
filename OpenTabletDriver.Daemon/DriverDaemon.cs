@@ -54,7 +54,10 @@ namespace OpenTabletDriver.Daemon
                 {
                     // 记录已知平板被移除的时刻（睡眠断开签名），供重连自愈判定
                     if (args.Removals.Any(x => Driver.KnownVendorIDs.Contains(x.VendorID)))
+                    {
                         _lastKnownTabletRemoval = DateTime.UtcNow;
+                        Log.Write(nameof(DriverDaemon), "Known tablet removed; removal timestamp recorded for wake-reconnect self-heal", LogLevel.Debug);
+                    }
                     return;
                 }
 

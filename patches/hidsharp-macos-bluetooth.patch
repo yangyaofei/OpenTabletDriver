@@ -148,7 +148,7 @@ index f32f138..2947841 100644
                                  }
                              }
 diff --git a/HidSharp/Platform/MacOS/MacHidStream.cs b/HidSharp/Platform/MacOS/MacHidStream.cs
-index 8cd1af4..ca1cca1 100644
+index 8cd1af4..c83d398 100644
 --- a/HidSharp/Platform/MacOS/MacHidStream.cs
 +++ b/HidSharp/Platform/MacOS/MacHidStream.cs
 @@ -49,7 +49,7 @@ namespace HidSharp.Platform.MacOS
@@ -160,7 +160,7 @@ index 8cd1af4..ca1cca1 100644
                  {
                      string error;
  
-@@ -143,10 +143,30 @@ namespace HidSharp.Platform.MacOS
+@@ -143,10 +143,40 @@ namespace HidSharp.Platform.MacOS
                      {
                          if (queue.Count < 512) { queue.Enqueue(reportBytes); Monitor.PulseAll(queue); }
                      }
@@ -185,13 +185,23 @@ index 8cd1af4..ca1cca1 100644
 +            return v;
 +        }
 +
++        /// <summary>窗口内「空闲伪影」次数（≥100ms 的陈旧唤醒，通常是 1Hz 心跳错过 pulse）。</summary>
++        public static long _diagStaleWakeups;
++
++        public static long SwapDiagStaleWakeups()
++        {
++            long v = _diagStaleWakeups;
++            _diagStaleWakeups = 0;
++            return v;
++        }
++
 +        /// <summary>当前近似队列深度（入队数−读取数）。</summary>
 +        public static long DiagQueueDepth => _diagEnqueued - _diagRead;
 +
          void RemovalCallback(IntPtr context, NativeMethods.IOReturn result, IntPtr sender)
          {
              CommonDisconnected(_inputQueue);
-@@ -187,7 +207,18 @@ namespace HidSharp.Platform.MacOS
+@@ -187,7 +217,21 @@ namespace HidSharp.Platform.MacOS
  
          public override int Read(byte[] buffer, int offset, int count)
          {
@@ -204,7 +214,10 @@ index 8cd1af4..ca1cca1 100644
 +                {
 +                    double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - _diagLastEnqueueTicks)
 +                                * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-+                    if (ms > _diagMaxKernelToReadMs) _diagMaxKernelToReadMs = ms;
++                    if (ms >= 100)
++                        _diagStaleWakeups++;          // 空闲心跳竞态伪影，不计入流内延迟
++                    else if (ms > _diagMaxKernelToReadMs)
++                        _diagMaxKernelToReadMs = ms;  // 流内：内核→读取 真延迟
 +                }
 +            }
 +            return n;
