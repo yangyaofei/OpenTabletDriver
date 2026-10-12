@@ -101,8 +101,16 @@ namespace OpenTabletDriver.UX.Controls
             protected virtual async Task OnProfilesChanged()
             {
                 ProfilesChanged?.Invoke(this, EventArgs.Empty);
-                var tablets = await App.Driver.Instance!.GetTablets();
-                HandleTabletsChanged(this, [.. tablets]);
+                try
+                {
+                    var tablets = await App.Driver.Instance!.GetTablets();
+                    HandleTabletsChanged(this, [.. tablets]);
+                }
+                catch (Exception e) when (e is ObjectDisposedException or System.IO.IOException or OperationCanceledException)
+                {
+                    // daemon 掉线/重启期间 RPC 对象已释放：静默跳过本次刷新，
+                    // 避免未处理异常把整个 UX 拖崩（连带杀死其守护的 daemon）。
+                }
             }
 
             public BindableBinding<TabletSwitcher, ProfileCollection> ProfilesBinding

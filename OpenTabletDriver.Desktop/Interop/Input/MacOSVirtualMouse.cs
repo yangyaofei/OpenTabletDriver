@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Diagnostics;
 using System.Numerics;
 using OpenTabletDriver.Desktop.Interop.Input.Keyboard;
@@ -63,6 +64,13 @@ namespace OpenTabletDriver.Desktop.Interop.Input
             _mouseEvent = CGEventCreate(_eventSource);
             _keyboard = DesktopInterop.VirtualKeyboard as MacOSVirtualKeyboard
                         ?? throw new InvalidOperationException("Could not get virtual keyboard");
+            _movePoster = new Thread(MovePosterLoop)
+            {
+                IsBackground = true,
+                Name = "otd-move-poster",
+                Priority = ThreadPriority.AboveNormal
+            };
+            _movePoster.Start();
         }
 
         public void MouseDown(MouseButton button)
@@ -94,6 +102,7 @@ namespace OpenTabletDriver.Desktop.Interop.Input
             if (_currButtonStates != _prevButtonStates)
             {
                 // keys here just changed, no drag event should be sent
+                DrainPendingMove(); // 在途移动先落地，保证点击位置先于按键（顺序）
                 ProcessKeyStates(_prevButtonStates, _currButtonStates);
                 _prevButtonStates = _currButtonStates;
             }
@@ -102,17 +111,86 @@ namespace OpenTabletDriver.Desktop.Interop.Input
                 // can send drag here
                 var lastButtonSet = IsButtonSet(_currButtonStates, _lastButton);
                 var cgEventType = ToDragCGEventType(_lastButton, lastButtonSet);
-                CGEventSetType(_mouseEvent, cgEventType);
-                SetPendingPosition(_mouseEvent, position.X, position.Y);
-                ApplyTabletValues();
-                PostEvent();
+                // 事件在读线程构建（状态快照一致），投递交给专职线程：
+                // WindowServer 忙碌（全屏动画等）时 CGEventPost 可阻塞数百毫秒，
+                // 同步投递会把整个读管线拖停（实测 onReportMax 297ms）。
+                var moveEvent = CGEventCreate(_eventSource);
+                CGEventSetType(moveEvent, cgEventType);
+                SetPendingPosition(moveEvent, position.X, position.Y);
+                ApplyTabletValues(moveEvent);
+                EnqueueAsyncMove(moveEvent);
             }
             if (_scrollDeltaX.HasValue || _scrollDeltaY.HasValue)
             {
+                DrainPendingMove(); // 滚轮前同样先排空移动，保序
                 var scrollEventRef = CGEventCreateScrollWheelEvent2(IntPtr.Zero, CGScrollEventUnit.kCGScrollEventUnitPixel, 2, _scrollDeltaX ?? 0, _scrollDeltaY ?? 0, 0);
                 CGEventPost(CGEventTapLocation.kCGHIDEventTap, scrollEventRef);
                 CFRelease(scrollEventRef);
                 _scrollDeltaX = _scrollDeltaY = null;
+            }
+        }
+
+        // ---- 异步移动投递（latest-wins 合并；按键/滚动同步路径靠 DrainPendingMove 保序）----
+        private readonly object _moveGate = new();
+        private IntPtr _pendingMoveEvent; // 未投递的最新移动事件（构建线程→投递线程所有权转移）
+        private Thread? _movePoster;
+        private static int _postStallCount;
+
+        private void EnqueueAsyncMove(IntPtr evt)
+        {
+            IntPtr stale = IntPtr.Zero;
+            lock (_moveGate)
+            {
+                if (_pendingMoveEvent != IntPtr.Zero)
+                    stale = _pendingMoveEvent;
+                _pendingMoveEvent = evt;
+                Monitor.Pulse(_moveGate);
+            }
+            if (stale != IntPtr.Zero)
+                CFRelease(stale); // 被更新位置覆盖，丢弃（位置流只有最新值有意义）
+        }
+
+        private void DrainPendingMove()
+        {
+            IntPtr evt = IntPtr.Zero;
+            lock (_moveGate)
+            {
+                if (_pendingMoveEvent != IntPtr.Zero)
+                {
+                    evt = _pendingMoveEvent;
+                    _pendingMoveEvent = IntPtr.Zero;
+                }
+            }
+            if (evt != IntPtr.Zero)
+            {
+                CGEventPost(CGEventTapLocation.kCGHIDEventTap, evt);
+                CFRelease(evt);
+            }
+        }
+
+        private void MovePosterLoop()
+        {
+            while (true)
+            {
+                IntPtr evt;
+                lock (_moveGate)
+                {
+                    while (_pendingMoveEvent == IntPtr.Zero)
+                        Monitor.Wait(_moveGate, 100);
+                    evt = _pendingMoveEvent;
+                    _pendingMoveEvent = IntPtr.Zero;
+                }
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                CGEventPost(CGEventTapLocation.kCGHIDEventTap, evt);
+                double ms = sw.Elapsed.TotalMilliseconds;
+                CFRelease(evt);
+                if (ms > 100)
+                {
+                    System.Threading.Interlocked.Increment(ref _postStallCount);
+                    OpenTabletDriver.Plugin.Log.Write("MacOSVirtualMouse",
+                        $"[POSTSTALL] CGEventPost blocked {ms:F0}ms (total stalls={System.Threading.Interlocked.CompareExchange(ref _postStallCount, 0, 0)})",
+                        OpenTabletDriver.Plugin.LogLevel.Debug);
+                }
             }
         }
 
@@ -248,7 +326,7 @@ namespace OpenTabletDriver.Desktop.Interop.Input
                     }
                     CGEventSetIntegerValueField(_mouseEvent, CGEventField.mouseEventButtonNumber, i);
                     CGEventSetIntegerValueField(_mouseEvent, CGEventField.mouseEventClickState, _clickState); // clickState should be set to 1 (or more) during up, down, and drag events
-                    ApplyTabletValues();
+                    ApplyTabletValues(_mouseEvent);
                     PostEvent();
                     _lastButton = button;
                 }
@@ -311,7 +389,7 @@ namespace OpenTabletDriver.Desktop.Interop.Input
                 buttonStates &= ~(1 << (int)button);
         }
 
-        private void ApplyTabletValues()
+        private void ApplyTabletValues(IntPtr evt)
         {
             // Send proximity events if there are no reports for a while.
             if (_currButtonStates == 0 && _prevButtonStates == 0)
@@ -326,12 +404,12 @@ namespace OpenTabletDriver.Desktop.Interop.Input
 
                     PostProximityEvent();
 
-                    CGEventSetIntegerValueField(_mouseEvent, CGEventField.mouseEventSubtype, (long)CGMouseEventSubtype.TabletProximity);
-                    CGEventSetIntegerValueField(_mouseEvent, CGEventField.tabletProximityEventEnterProximity, 1);
-                    CGEventSetIntegerValueField(_mouseEvent, CGEventField.tabletProximityEventPointerType, (long)pointerType);
-                    CGEventSetIntegerValueField(_mouseEvent, CGEventField.tabletProximityEventCapabilityMask, (long)TabletCapabilityMask);
-                    CGEventSetIntegerValueField(_mouseEvent, CGEventField.tabletProximityEventDeviceID, DeviceId);
-                    CGEventSetIntegerValueField(_mouseEvent, CGEventField.tabletProximityEventVendorPointerType, VendorPointerType);
+                    CGEventSetIntegerValueField(evt, CGEventField.mouseEventSubtype, (long)CGMouseEventSubtype.TabletProximity);
+                    CGEventSetIntegerValueField(evt, CGEventField.tabletProximityEventEnterProximity, 1);
+                    CGEventSetIntegerValueField(evt, CGEventField.tabletProximityEventPointerType, (long)pointerType);
+                    CGEventSetIntegerValueField(evt, CGEventField.tabletProximityEventCapabilityMask, (long)TabletCapabilityMask);
+                    CGEventSetIntegerValueField(evt, CGEventField.tabletProximityEventDeviceID, DeviceId);
+                    CGEventSetIntegerValueField(evt, CGEventField.tabletProximityEventVendorPointerType, VendorPointerType);
 
                     return;
                 }
@@ -347,20 +425,20 @@ namespace OpenTabletDriver.Desktop.Interop.Input
             else if (IsButtonSet(_currButtonStates, CGMouseButton.kCGMouseButtonCenter))
                 buttons |= 4;
 
-            CGEventSetDoubleValueField(_mouseEvent, CGEventField.mouseEventPressure, _pressure ?? 1.0);
+            CGEventSetDoubleValueField(evt, CGEventField.mouseEventPressure, _pressure ?? 1.0);
 
-            CGEventSetIntegerValueField(_mouseEvent, CGEventField.mouseEventSubtype, (long)CGMouseEventSubtype.TabletPoint);
+            CGEventSetIntegerValueField(evt, CGEventField.mouseEventSubtype, (long)CGMouseEventSubtype.TabletPoint);
             // The fields of tabletEvent can only be set after the subtype is defined.
-            CGEventSetIntegerValueField(_mouseEvent, CGEventField.tabletEventPointButtons, buttons);
-            CGEventSetIntegerValueField(_mouseEvent, CGEventField.tabletEventDeviceID, DeviceId);
-            CGEventSetDoubleValueField(_mouseEvent, CGEventField.tabletEventPointPressure, _pressure ?? 1.0);
+            CGEventSetIntegerValueField(evt, CGEventField.tabletEventPointButtons, buttons);
+            CGEventSetIntegerValueField(evt, CGEventField.tabletEventDeviceID, DeviceId);
+            CGEventSetDoubleValueField(evt, CGEventField.tabletEventPointPressure, _pressure ?? 1.0);
 
             if (_tilt != null)
             {
-                CGEventSetDoubleValueField(_mouseEvent, CGEventField.tabletEventTiltX, _tilt.Value.X / 90.0);
+                CGEventSetDoubleValueField(evt, CGEventField.tabletEventTiltX, _tilt.Value.X / 90.0);
                 // TiltY is inverted on MacOS
                 // see https://github.com/chromium/chromium/blob/62f1a92b04c1172431a64d581be9e64742c81576/content/browser/renderer_host/input/web_input_event_builders_mac.mm#L431
-                CGEventSetDoubleValueField(_mouseEvent, CGEventField.tabletEventTiltY, -_tilt.Value.Y / 90.0);
+                CGEventSetDoubleValueField(evt, CGEventField.tabletEventTiltY, -_tilt.Value.Y / 90.0);
             }
 
             // This uses an undocumented flag that tells the system to automatically include the event flags in the event.
@@ -369,9 +447,9 @@ namespace OpenTabletDriver.Desktop.Interop.Input
             // However, this flag has not effects for synthetic keyboard events, so we manually set the flags if there are modifiers bindings.
 
             if (_keyboard.getCurrentFlags() != 0)
-                CGEventSetFlags(_mouseEvent, _keyboard.getCurrentFlags());
+                CGEventSetFlags(evt, _keyboard.getCurrentFlags());
             else
-                CGEventSetFlags(_mouseEvent, ~0U);
+                CGEventSetFlags(evt, ~0U);
         }
 
         private void PostEvent()
